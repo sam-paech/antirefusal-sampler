@@ -1,0 +1,62 @@
+# API and Model Configuration
+api:
+  base_url: "http://localhost:8000/v1" # vLLM OpenAI-compatible endpoint
+  api_key: ""                          # If your vLLM instance needs it (e.g., "EMPTY")
+  model_name: "mistralai/Mistral-7B-Instruct-v0.1" # Model identifier for API
+  # Model ID for chat template (if different or for clarity)
+  chat_template_model_id: "mistralai/Mistral-7B-Instruct-v0.1"
+  timeout_seconds: 120
+
+# Exploration Parameters
+exploration:
+  # How many top logprob tokens to consider as beam starters at each step
+  beam_starters_top_k: 10 # Reduced for initial testing
+  # Length of greedy sampling after a beam starter is chosen
+  greedy_sample_length: 50 # Reduced for initial testing
+  max_exploration_depth: 3      # Max number of token steps to branch on
+  max_total_generation_length: 200 # Max length of prompt + generated text
+
+# Sampling Parameters for Beam Starters (applied to logprobs before picking top_k)
+sampling_beam_starters:
+  temperature: 0.7
+  min_p: 0.03 # Crucial for constraining choices
+  # top_p: 1.0 (optional, min_p is often more effective here)
+  # top_k_filter: 50 (optional, distinct from beam_starters_top_k which is for selection)
+
+# Datasets to process (list)
+datasets:
+  - name: "example_harmful_prompts"
+    type: "jsonl" # 'jsonl' or 'hf_dataset'
+    path: "data/sample_prompts.jsonl" # For jsonl
+    # hf_id: "some/sharegpt_dataset" # For hf_dataset
+    # hf_split: "train" # For hf_dataset
+    prompt_field: "question" # For jsonl, if not 'question'
+    category_field: "category" # For jsonl, if not 'category'
+    id_field: "id" # For jsonl, if not 'id'
+  # - name: "benign_set1"
+  #   type: "hf_dataset"
+  #   hf_id: "HuggingFaceH4/helpful_instructions"
+  #   hf_split: "test" # Example, pick a small one
+
+# Quota Configuration (per model)
+# Max (refusal + non-refusal) examples per item
+quotas:
+  single_token: 100 # Reduced for initial testing
+  token_pair: 50   # (prev_token, current_split_token)
+  bigram: 50       # Stopwords removed
+  trigram: 30      # Stopwords removed
+
+# N-gram Configuration (for quota tracking)
+ngrams:
+  language: "english" # For stopword removal
+  # Ensure NLTK data 'punkt' and 'stopwords' are downloaded
+
+# Refusal Classification
+refusal_classifier:
+  model_id: "NousResearch/Minos-v1" # Or your preferred classifier
+  threshold: 0.8
+
+# System
+database_path: "results/antirefusal_sampler_data.sqlite"
+logging_level: "INFO" # DEBUG, INFO, WARNING, ERROR
+max_workers: 20 # Number of parallel prompt processing workers

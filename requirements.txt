@@ -1,0 +1,20 @@
+# Core
+python>=3.8
+
+# LLM & ML
+requests>=2.25.1
+transformers>=4.30.0
+torch>=2.0.0
+# For efficient RefusalDetector loading (optional, if using 4-bit quantization)
+# accelerate>=0.20.3
+# bitsandbytes>=0.40.0
+
+# Data Handling
+PyYAML>=6.0
+# sqlite3 is in standard library
+datasets>=2.10.0 # For Hugging Face dataset loading
+nltk>=3.6.5
+
+# Utilities
+tqdm>=4.60.0
+# pydantic>=2.0 # Optional, for config and data model validation
