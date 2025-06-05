@@ -196,7 +196,7 @@ class ApiClient:
             "max_tokens": num_tokens,
             "temperature": 0.001, # Effectively greedy
             "top_p": 1.0,
-            "logprobs": None, # Not typically needed for greedy sampling unless debugging
+            "logprobs": 1, # Not typically needed for greedy sampling unless debugging
         }
         if stop_sequences:
             payload["stop"] = stop_sequences

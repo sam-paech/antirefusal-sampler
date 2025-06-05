@@ -7,7 +7,25 @@ import threading
 import logging
 from typing import Tuple, Optional, Dict
 
-import torch
+import torch                                   # add these two lines
+def _noop_compile(fn=None, *a, **kw):
+    """
+    Behaves like torch.compile, but just returns the
+    original function so nothing is compiled.
+
+    • If used as @torch.compile(dynamic=True) → returns
+      a decorator waiting for the real fn.
+    • If used as @torch.compile → gets fn directly.
+    """
+    if fn is None:                       # called with kwargs only
+        def decorator(real_fn):
+            return real_fn
+        return decorator
+    return fn                            # called with the fn itself
+
+if hasattr(torch, "compile"):
+    torch.compile = _noop_compile        # monkey-patch once
+    
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
@@ -79,10 +97,17 @@ class RefusalDetector:
                     logger.warning(f"Failed to set up BitsAndBytes quantization: {e}. Proceeding without quantization.")
 
 
-            self.model = AutoModelForSequenceClassification.from_pretrained(
-                model_id,
-                **model_kwargs
-            )
+            try:                                            # ModernBERT & friends
+                self.model = AutoModelForSequenceClassification.from_pretrained(
+                    model_id,
+                    reference_compile=False,                # <- disable torch.compile wrappers
+                    **model_kwargs
+                )
+            except TypeError:                               # models that don’t recognise the arg
+                self.model = AutoModelForSequenceClassification.from_pretrained(
+                    model_id,
+                    **model_kwargs
+                )
             # No explicit .to(device) needed if quantization_config is used with BitsAndBytes,
             # as it handles device placement. If not using BNB, model needs .to(device).
             if not (use_bnb_quantization and self.device == "cuda" and "quantization_config" in model_kwargs):
@@ -143,7 +168,7 @@ class RefusalDetector:
             assistant_ids = self.tokenizer.encode(assistant_text, add_special_tokens=False)
             static_ids = self.tokenizer.encode(self._chat_wrap("", ""), add_special_tokens=False) # Template overhead
 
-        current_user_len = len(self.tokenizer.encode(temp_user_text, add_special_tokens=False))
+            current_user_len = len(self.tokenizer.encode(temp_user_text, add_special_tokens=False))
         total_len = len(static_ids) + current_user_len + len(assistant_ids)
 
         if total_len <= self.max_len:
@@ -192,7 +217,15 @@ class RefusalDetector:
                 ).to(self.device)
 
             with torch.no_grad():
-                logits = self.model(**inputs).logits
+                # ModernBERT inside Minos tries to run under torch.compile; wrap in
+                # a “no-opt” context so FX-on-Dynamo tracing never triggers.
+                try:
+                    noopt = torch._dynamo.noopt_context   # available in 2.1+
+                except AttributeError:                    # fall-back for older Torch
+                    from contextlib import nullcontext
+                    noopt = nullcontext
+                with noopt():
+                    logits = self.model(**inputs).logits
                 probs = torch.softmax(logits, dim=-1)[0]
                 label_id = int(torch.argmax(probs).item())
                 confidence = float(probs[label_id].item()) # Ensure it's a Python float

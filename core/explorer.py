@@ -121,7 +121,12 @@ class BeamExplorer:
             [2, 3] # bigrams and trigrams
         )
         for ngram_type_key, ngram_list in relevant_ngrams.items():
-            ngram_size_str = ngram_type_key # "bigram" or "trigram"
+            if ngram_type_key.startswith("2"):
+                ngram_size_str = "bigram"
+            elif ngram_type_key.startswith("3"):
+                ngram_size_str = "trigram"
+            else:
+                ngram_size_str = ngram_type_key
             for ngram_text in ngram_list:
                 self.db_manager.update_ngram_quota(self.model_db_id, ngram_size_str, ngram_text, is_refusal)
 
