@@ -15,6 +15,9 @@ exploration:
   greedy_sample_length: 50 # Reduced for initial testing
   max_exploration_depth: 3      # Max number of token steps to branch on
   max_total_generation_length: 200 # Max length of prompt + generated text
+  pilot_beam_length: 8    # tokens to append greedily to each freshly-split beam
+  branch_cap:        200   # max simultaneous live beams per prompt
+  balance_ratio:     0.5  # after cap is hit: keep 50 % refusal / 50 % non-refusal (rounded)
 
 # Sampling Parameters for Beam Starters (applied to logprobs before picking top_k)
 sampling_beam_starters:

@@ -2,6 +2,9 @@ import logging
 import json
 from typing import List, Optional, Dict, Any
 from pathlib import Path
+import random
+from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils.config_loader import AppConfig
 from utils.token_utils import decode_token, decode_token_path
@@ -12,6 +15,7 @@ from classification.refusal_detector import RefusalDetector
 from data_handling.database import DatabaseManager
 from core.sampling import Sampler
 from core.models import PromptData # Assuming PromptData is defined
+from core.beam import Beam
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +40,7 @@ class BeamExplorer:
         self.model_db_id = model_db_id
         self.prompt_data = prompt_data # Contains original_id, category, text, db_id
 
-        self.sampler = Sampler(config.sampling_beam_starters)
+        self.sampler = Sampler(asdict(config.sampling_beam_starters))
         
         self.exploration_params = config.exploration
         self.quota_params = config.quotas
@@ -122,151 +126,150 @@ class BeamExplorer:
                 self.db_manager.update_ngram_quota(self.model_db_id, ngram_size_str, ngram_text, is_refusal)
 
 
-    def explore(self, current_beam_path_raw: List[str], current_depth: int, current_path_decoded_words: List[str]):
+    # core/explorer.py  –  replace the whole explore() method
+    def explore(self) -> None:
         """
-        Recursively explores token paths.
-        current_beam_path_raw: List of raw token strings from the API forming the current path.
-        current_depth: The number of branching steps taken so far.
-        current_path_decoded_words: List of cleaned, decoded words corresponding to current_beam_path_raw.
+        Breadth-first beam expansion that matches the requested flow:
+
+        • layer-0: prompt prefix, pick top-k next-tokens (after min_p etc.)
+        • append `pilot_beam_length` greedy tokens to each child
+        • run refusal detector on the resulting text
+        • repeat for the next position, branching every live beam
+        • keep at most `branch_cap` beams – stratified 50/50 by refusal state
         """
-        logger.info(f"Exploring prompt '{self.prompt_data.original_id}', depth {current_depth}, path_len {len(current_beam_path_raw)}")
+        cfg  = self.config
+        ex   = cfg.exploration
+        samp = self.sampler
+        pilot_len   = ex.pilot_beam_length
+        cap         = ex.branch_cap
+        balance_p   = ex.balance_ratio
 
-        # Base Cases for Recursion
-        if current_depth >= self.exploration_params.max_exploration_depth:
-            logger.debug(f"Max exploration depth ({self.exploration_params.max_exploration_depth}) reached.")
-            return
-        if len(current_beam_path_raw) >= self.exploration_params.max_total_generation_length:
-            logger.debug(f"Max total generation length ({self.exploration_params.max_total_generation_length}) reached.")
-            return
+        # --- frontier initialisation ---------------------------------
+        frontier: list[Beam] = [Beam(tokens_raw=[], decoded_words=[], depth=0)]
 
-        # Construct Current Prefix for API
-        current_path_decoded_text = decode_token_path(current_beam_path_raw)
-        if self.chat_formatter:
-            api_prompt_prefix = self.chat_formatter.build_prompt(self.prompt_data.text, current_path_decoded_text)
-        else:
-            api_prompt_prefix = self.prompt_data.text + current_path_decoded_text
-        
-        # Get Logprobs for the next token
-        try:
-            logprobs_response = self.api_client.get_next_token_logprobs(
-                api_prompt_prefix,
-                top_n_logprobs=self.config.api.get('top_logprobs_count_for_beams', self.exploration_params.beam_starters_top_k * 2), # Request more than needed
-                sampling_params=self.config.sampling_beam_starters # Pass the dict directly
-            )
-        except Exception as e:
-            logger.error(f"API call for logprobs failed at depth {current_depth} for prompt '{self.prompt_data.original_id}': {e}", exc_info=True)
-            return
+        while frontier:
+            # -------- expand every live beam in parallel --------------
+            next_frontier: list[Beam] = []
 
-        if not logprobs_response.logprobs:
-            logger.warning(f"No logprobs received from API at depth {current_depth} for prompt '{self.prompt_data.original_id}'. Stopping this path.")
-            return
+            # batch RPCs for speed – one /completions per beam
+            reqs = []
+            for beam in frontier:
+                prefix_text = decode_token_path(beam.tokens_raw)
+                full_prompt = (self.chat_formatter.build_prompt(self.prompt_data.text, prefix_text)
+                            if self.chat_formatter
+                            else self.prompt_data.text + prefix_text)
+                reqs.append((beam, full_prompt))
 
-        # Select Candidate Beam Starter Tokens
-        candidate_starter_tokens_raw = self.sampler.sample_candidate_tokens(
-            logprobs_response.logprobs,
-            self.exploration_params.beam_starters_top_k
-        )
+            # Send requests concurrently but keep ordering
+            with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
+                fut2beam = {pool.submit(
+                    self.api_client.get_next_token_logprobs,
+                    prompt_prefix=prompt,
+                    top_n_logprobs = ex.beam_starters_top_k * 2,
+                    sampling_params = asdict(cfg.sampling_beam_starters)
+                ): beam for beam, prompt in reqs}
 
-        if not candidate_starter_tokens_raw:
-            logger.info(f"No candidate starter tokens after sampling at depth {current_depth} for prompt '{self.prompt_data.original_id}'.")
-            return
+                for fut in as_completed(fut2beam):
+                    beam = fut2beam[fut]
+                    try:
+                        lp_resp = fut.result()
+                    except Exception as e:
+                        logger.error(f"logprob RPC failed: {e}")
+                        continue
 
-        logger.debug(f"Depth {current_depth}: Candidate starter tokens: {candidate_starter_tokens_raw}")
+                    cand_tok_raw = samp.sample_candidate_tokens(
+                        lp_resp.logprobs,
+                        ex.beam_starters_top_k
+                    )
+                    if not cand_tok_raw:
+                        continue
 
-        for starter_token_raw in candidate_starter_tokens_raw:
-            # Quota Check (more detailed logic needed here)
-            # This check needs the `current_path_decoded_words` to correctly form n-grams for quota checking.
-            starter_token_decoded_for_ngram = decode_token(starter_token_raw)
-            cleaned_starter_token_words = self.ngram_util._tokenize_and_clean(starter_token_decoded_for_ngram)
+                    # each candidate becomes a child beam
+                    for tok_raw in cand_tok_raw:
+                        # greedy tail
+                        greedy_prefix = (self.chat_formatter.build_prompt(
+                            self.prompt_data.text,
+                            decode_token_path(beam.tokens_raw + [tok_raw])
+                        ) if self.chat_formatter else
+                            self.prompt_data.text + decode_token_path(beam.tokens_raw + [tok_raw]))
 
-            # Check single token quota
-            if self._is_quota_met('single_token', {'token_raw': starter_token_raw}, self.quota_params.single_token):
-                continue
+                        try:
+                            greedy_resp = self.api_client.greedy_sample(
+                                greedy_prefix,
+                                num_tokens = pilot_len
+                            )
+                            tail_raw = greedy_resp.token_strings_raw
+                        except Exception as e:
+                            logger.error(f"greedy RPC failed: {e}")
+                            tail_raw = []
 
-            # Check token pair quota
-            if current_beam_path_raw:
-                prev_token_raw = current_beam_path_raw[-1]
-                if self._is_quota_met('token_pair', {'prev_token_raw': prev_token_raw, 'split_token_raw': starter_token_raw}, self.quota_params.token_pair):
-                    continue
-            
-            # Check N-gram quotas
-            # `current_path_decoded_words` is the list of cleaned words for the path *before* this starter_token
-            relevant_ngrams_for_quota = self.ngram_util.get_relevant_ngrams_for_token(
-                current_path_decoded_words, 
-                starter_token_decoded_for_ngram, # Use the full decoded string for context
-                [2, 3]
-            )
-            ngram_quota_met_flag = False
-            for ngram_type_key, ngram_list in relevant_ngrams_for_quota.items():
-                ngram_size_str = ngram_type_key 
-                quota_val = getattr(self.quota_params, ngram_size_str.replace("gram",""), 0) # e.g. quotas.bigram
-                if not quota_val: continue # Should not happen if config is right
+                        full_raw_path = beam.tokens_raw + [tok_raw] + tail_raw
+                        full_decoded  = decode_token_path(full_raw_path)
 
-                for ngram_text in ngram_list:
-                    if self._is_quota_met(ngram_size_str, {'ngram_text': ngram_text}, quota_val):
-                        ngram_quota_met_flag = True
-                        break
-                if ngram_quota_met_flag: break
-            if ngram_quota_met_flag:
-                continue
+                        # refusal classification
+                        is_ref, conf, lbl = self.refusal_detector.is_refusal(
+                            self.prompt_data.text, full_decoded,
+                            threshold=cfg.refusal_classifier.threshold
+                        )
 
+                        # record (exactly as old code did)
+                        self.db_manager.record_exploration_result(
+                            model_db_id = self.model_db_id,
+                            prompt_db_id = self.prompt_data.db_id,
+                            beam_path_raw = full_raw_path,
+                            split_token_raw = tok_raw,
+                            full_generation_text_decoded = full_decoded,
+                            is_refusal = is_ref,
+                            refusal_label = lbl,
+                            refusal_confidence = conf,
+                            exploration_depth = beam.depth
+                        )
 
-            # If all quotas allow, proceed with this starter_token_raw
-            logger.debug(f"Depth {current_depth}: Processing starter token '{starter_token_raw}' (decoded: '{decode_token(starter_token_raw)}')")
+                        # bookkeeping + quotas
+                        cleaned_words = (beam.decoded_words +
+                                        self.ngram_util._tokenize_and_clean(
+                                            decode_token(tok_raw)
+                                        ) +
+                                        self.ngram_util._tokenize_and_clean(
+                                            decode_token_path(tail_raw)
+                                        ))
+                        self._update_all_quotas(
+                            current_beam_path_raw = beam.tokens_raw,
+                            split_token_raw       = tok_raw,
+                            is_refusal            = is_ref,
+                            previous_decoded_words_for_ngram = beam.decoded_words
+                        )
 
-            # Construct prefix for greedy sampling
-            path_with_starter_decoded = decode_token_path(current_beam_path_raw + [starter_token_raw])
-            if self.chat_formatter:
-                greedy_sample_prefix = self.chat_formatter.build_prompt(self.prompt_data.text, path_with_starter_decoded)
-            else:
-                greedy_sample_prefix = self.prompt_data.text + path_with_starter_decoded
-            
-            # Greedy Sample Continuation
-            try:
-                greedy_response = self.api_client.greedy_sample(
-                    greedy_sample_prefix,
-                    self.exploration_params.greedy_sample_length
-                )
-                continuation_tokens_raw = greedy_response.token_strings_raw
-            except Exception as e:
-                logger.error(f"API call for greedy sampling failed for starter '{starter_token_raw}': {e}", exc_info=True)
-                continue # Skip this starter token
+                        # child beam for next layer – it starts *after* the pilot segment
+                        next_frontier.append(
+                            Beam(
+                                tokens_raw   = full_raw_path,
+                                decoded_words = cleaned_words,
+                                depth = beam.depth + 1,
+                                is_refusal = is_ref,
+                                conf = conf
+                            )
+                        )
 
-            # Full Generation Path
-            full_generated_path_raw = current_beam_path_raw + [starter_token_raw] + continuation_tokens_raw
-            full_generated_text_decoded = decode_token_path(full_generated_path_raw)
-            
-            # Classify Refusal
-            is_refusal, confidence, label = self.refusal_detector.is_refusal(
-                self.prompt_data.text, # Original prompt
-                full_generated_text_decoded, # Full decoded generation from this beam
-                threshold=self.config.refusal_classifier.threshold
-            )
-            logger.info(f"Prompt '{self.prompt_data.original_id}', Starter '{decode_token(starter_token_raw)}', Depth {current_depth}: Refusal={is_refusal}, Label='{label}', Conf={confidence:.2f}")
+            # -------- branch-cap & balancing ---------------------------
+            if len(next_frontier) > cap:
+                refusals     = [b for b in next_frontier if  b.is_refusal]
+                non_refusals = [b for b in next_frontier if not b.is_refusal]
 
-            # Record Result
-            self.db_manager.record_exploration_result(
-                model_db_id=self.model_db_id,
-                prompt_db_id=self.prompt_data.db_id,
-                beam_path_raw=current_beam_path_raw + [starter_token_raw], # Path up to and including the split token
-                split_token_raw=starter_token_raw,
-                full_generation_text_decoded=full_generated_text_decoded,
-                is_refusal=is_refusal,
-                refusal_label=label,
-                refusal_confidence=confidence,
-                exploration_depth=current_depth 
-            )
+                keep_ref = int(cap * balance_p)
+                keep_non = cap - keep_ref
 
-            # Update Quotas
-            # `current_path_decoded_words` is correct here as it's the path *before* `starter_token_raw`
-            self._update_all_quotas(current_beam_path_raw, starter_token_raw, is_refusal, current_path_decoded_words)
+                random.shuffle(refusals)
+                random.shuffle(non_refusals)
 
-            # Recurse
-            # Update current_path_decoded_words for the next level
-            new_path_decoded_words = current_path_decoded_words + cleaned_starter_token_words
-            
-            self.explore(
-                current_beam_path_raw=current_beam_path_raw + [starter_token_raw],
-                current_depth=current_depth + 1,
-                current_path_decoded_words=new_path_decoded_words
-            )
+                next_frontier = refusals[:keep_ref] + non_refusals[:keep_non]
+
+            # depth / length termination
+            if not next_frontier:
+                break
+            if next_frontier[0].depth >= ex.max_exploration_depth:
+                break
+            if any(len(b.tokens_raw) >= ex.max_total_generation_length for b in next_frontier):
+                break
+
+            frontier = next_frontier

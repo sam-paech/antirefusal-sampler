@@ -7,7 +7,8 @@ import nltk
 logger = logging.getLogger(__name__)
 
 _NLTK_DATA_ENSURED = False
-_NLTK_DOWNLOAD_LOCK = nltk.downloader.Lock() # Use NLTK's lock for thread-safety
+import threading
+_NLTK_DOWNLOAD_LOCK = threading.Lock() 
 
 def _ensure_nltk_data():
     global _NLTK_DATA_ENSURED

@@ -3,6 +3,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
+from dataclasses import asdict
 
 from utils.config_loader import load_config, AppConfig
 from utils.logging_setup import setup_logging
@@ -47,7 +48,7 @@ def process_single_prompt(
             prompt_data=prompt_data
         )
         # Initial call to explorer
-        explorer.explore(current_beam_path_raw=[], current_depth=0, current_path_decoded_words=[])
+        explorer.explore()
         
         # Update last processed prompt ID for this specific dataset and model
         db_manager.set_last_processed_prompt_id(
@@ -68,7 +69,7 @@ def process_single_prompt(
 
 def main():
     parser = argparse.ArgumentParser(description="AntiRefusal Sampler: Explore token paths for refusal analysis.")
-    parser.add_argument("--config", type=str, default="configs/current_config.yaml", help="Path to the YAML configuration file.")
+    parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to the YAML configuration file.")
     parser.add_argument("--resume", action="store_true", help="Resume processing from the last saved state for each dataset.")
     # parser.add_argument("--max-prompts-per-dataset", type=int, default=None, help="Maximum number of new prompts to process per dataset in this run.")
 
@@ -87,10 +88,10 @@ def main():
     # Get or create model_db_id
     # For simplicity, storing a subset of config related to the model run
     model_config_details = {
-        "api": dict(config.api), # Convert Pydantic-like to dict
-        "exploration": dict(config.exploration),
-        "sampling_beam_starters": dict(config.sampling_beam_starters),
-        "quotas": dict(config.quotas)
+        "api": asdict(config.api),
+        "exploration": asdict(config.exploration),
+        "sampling_beam_starters": asdict(config.sampling_beam_starters),
+        "quotas": asdict(config.quotas)
     }
     model_db_id = db_manager.add_model_if_not_exists(config.api.model_name, model_config_details)
     logger.info(f"Using model '{config.api.model_name}' (DB ID: {model_db_id})")
@@ -123,8 +124,8 @@ def main():
 
     prompts_to_process_all_datasets = []
 
-    for dataset_conf_dict in config.datasets:
-        dataset_conf = dict(dataset_conf_dict) # Convert Pydantic-like to dict
+    for dataset_conf_dataclass in config.datasets:
+        dataset_conf = asdict(dataset_conf_dataclass)
         dataset_name = dataset_conf['name']
         logger.info(f"Loading prompts for dataset: {dataset_name}")
         
