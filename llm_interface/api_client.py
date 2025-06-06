@@ -111,7 +111,7 @@ class ApiClient:
             "prompt": prompt_prefix,
             "max_tokens": 1,
             "logprobs": top_n_logprobs, # vLLM and OpenAI use 'logprobs' for count of top logprobs
-            "temperature": sampling_params.get("temperature", 0.7),
+            "temperature": sampling_params.get("temperature", 1.0),
             "top_p": sampling_params.get("top_p"), # Can be None
             "top_k": sampling_params.get("top_k_filter"), # Can be None
             "min_p": sampling_params.get("min_p"), # Custom for vLLM-like, might not be std OpenAI
@@ -194,8 +194,8 @@ class ApiClient:
         payload = {
             "prompt": prompt_prefix,
             "max_tokens": num_tokens,
-            "temperature": 0.001, # Effectively greedy
-            "top_p": 1.0,
+            "temperature": 1, # Effectively greedy
+            "min_p": 0.03,
             "logprobs": 1, # Not typically needed for greedy sampling unless debugging
         }
         if stop_sequences:

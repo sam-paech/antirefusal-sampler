@@ -21,8 +21,8 @@ exploration:
 
 # Sampling Parameters for Beam Starters (applied to logprobs before picking top_k)
 sampling_beam_starters:
-  temperature: 0.7
-  min_p: 0.03 # Crucial for constraining choices
+  temperature: 1.0
+  min_p: 0.00001 # Crucial for constraining choices
   # top_p: 1.0 (optional, min_p is often more effective here)
   # top_k_filter: 50 (optional, distinct from beam_starters_top_k which is for selection)
 

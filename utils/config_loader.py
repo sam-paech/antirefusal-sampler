@@ -21,12 +21,10 @@ class APIConfig:
 class ExplorationConfig:
     beam_starters_top_k: int
     pilot_beam_length: int
-    max_exploration_depth: int
-    max_total_generation_length: int
+    max_split_positions: int
     branch_cap: int
     balance_ratio: float
-    # kept for backward-compat even if unused now
-    greedy_sample_length: int = 0
+
 
 
 @dataclass

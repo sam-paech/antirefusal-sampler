@@ -12,9 +12,9 @@ from data_handling.database import DatabaseManager
 from data_handling.prompt_loader import PromptLoader
 from llm_interface.api_client import ApiClient
 from llm_interface.chat_formatter import ChatTemplateFormatter
-from classification.refusal_detector import RefusalDetector
 from core.explorer import BeamExplorer
 from core.models import PromptData
+from classification.refusal_worker import RefusalWorker, RefusalDetector
 
 
 logger = logging.getLogger(__name__) # Will be configured by setup_logging
@@ -26,7 +26,7 @@ def process_single_prompt(
     # Shared instances
     api_client: ApiClient,
     chat_formatter: Optional[ChatTemplateFormatter],
-    refusal_detector: RefusalDetector,
+    refusal_worker: RefusalWorker,
     db_manager: DatabaseManager, # Each thread will get its own connection from this manager
     ngram_util: NgramUtil
 ):
@@ -41,7 +41,7 @@ def process_single_prompt(
             config=config,
             api_client=api_client, # ApiClient is designed to be thread-safe with shared session
             chat_formatter=chat_formatter,
-            refusal_detector=refusal_detector, # RefusalDetector is thread-safe
+            refusal_worker=refusal_worker, # RefusalDetector is thread-safe
             db_manager=db_manager, # DatabaseManager handles thread-local connections
             ngram_util=ngram_util,
             model_db_id=model_db_id,
@@ -119,6 +119,13 @@ def main():
     if refusal_detector._failed:
         logger.error("Failed to initialize refusal detector. Exiting.")
         return
+    
+    refusal_worker = RefusalWorker(
+        refusal_detector,
+        max_batch=8,      # tune as you like
+        max_wait_ms=5
+    )
+
 
     ngram_util = NgramUtil(language=config.ngrams.language)
 
@@ -198,7 +205,7 @@ def main():
                 model_db_id,
                 api_client,
                 chat_formatter,
-                refusal_detector,
+                refusal_worker,
                 db_manager, # Pass the manager instance
                 ngram_util
             ): prompt_data.original_id

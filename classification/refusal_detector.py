@@ -260,3 +260,64 @@ class RefusalDetector:
         is_ref = (label_text.lower().strip() == "refusal") and (confidence >= threshold)
         logger.debug(f"Refusal check: Label='{label_text}', Confidence={confidence:.4f}, Threshold={threshold}, IsRefusal={is_ref}")
         return is_ref, confidence, label_text
+    
+    # ------------------------------------------------------------- #
+    #  simple batch wrapper so RefusalWorker can call us            #
+    # ------------------------------------------------------------- #
+    def is_refusal_batch(
+        self,
+        user_assistant_pairs: list[tuple[str, str]],
+        threshold: float = 0.8,
+    ) -> list[tuple[bool, float, str]]:
+        """
+        Classifies a list of (user, assistant) pairs in one model pass.
+
+        Returns a list of (is_refusal, confidence, label_text) tuples in the
+        same order as the input.
+        """
+        if self._failed or not self.model or not self.tokenizer:
+            # fast-fail – preserve ordering
+            err = [(False, 0.0, "error")] * len(user_assistant_pairs)
+            return err
+
+        # --- preprocess ----------------------------------------------------
+        # truncate each pair, then build combined chat strings
+        combined_texts: list[str] = []
+        for u, a in user_assistant_pairs:
+            u_, a_ = self._truncate_inputs(u, a)
+            combined_texts.append(self._chat_wrap(u_, a_))
+
+        # --- tokenise batch ------------------------------------------------
+        with self._tok_lock:   # tokenizer is not threadsafe
+            inputs = self.tokenizer(
+                combined_texts,
+                return_tensors="pt",
+                padding=True,          # pad to max in batch
+                truncation=True,
+                max_length=self.max_len,
+            ).to(self.device)
+
+        # --- single forward pass ------------------------------------------
+        with torch.no_grad():
+            try:
+                noopt = torch._dynamo.noopt_context
+            except AttributeError:      # torch < 2.1
+                from contextlib import nullcontext
+                noopt = nullcontext
+            with noopt():
+                logits = self.model(**inputs).logits        # [B, C]
+            probs = torch.softmax(logits, dim=-1)
+
+        # --- postprocess ---------------------------------------------------
+        results: list[tuple[bool, float, str]] = []
+        for p in probs:
+            label_id     = int(torch.argmax(p).item())
+            confidence   = float(p[label_id].item())
+            label_text   = self.id2label.get(label_id, str(label_id))
+            is_refusal   = (label_text.lower() == "refusal") and (confidence >= threshold)
+            results.append((is_refusal, confidence, label_text))
+
+        if self.device == "cuda":
+            del inputs, logits, probs
+            torch.cuda.empty_cache()
+        return results

@@ -5,13 +5,14 @@ from pathlib import Path
 import random
 from dataclasses import asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import concurrent
 
 from utils.config_loader import AppConfig
 from utils.token_utils import decode_token, decode_token_path
 from utils.ngram_utils import NgramUtil
 from llm_interface.api_client import ApiClient
 from llm_interface.chat_formatter import ChatTemplateFormatter
-from classification.refusal_detector import RefusalDetector
+from classification.refusal_worker import RefusalWorker
 from data_handling.database import DatabaseManager
 from core.sampling import Sampler
 from core.models import PromptData # Assuming PromptData is defined
@@ -25,7 +26,7 @@ class BeamExplorer:
         config: AppConfig,
         api_client: ApiClient,
         chat_formatter: Optional[ChatTemplateFormatter],
-        refusal_detector: RefusalDetector,
+        refusal_worker: RefusalWorker,
         db_manager: DatabaseManager,
         ngram_util: NgramUtil,
         model_db_id: int,
@@ -34,7 +35,7 @@ class BeamExplorer:
         self.config = config
         self.api_client = api_client
         self.chat_formatter = chat_formatter
-        self.refusal_detector = refusal_detector
+        self.refusal_worker = refusal_worker
         self.db_manager = db_manager
         self.ngram_util = ngram_util
         self.model_db_id = model_db_id
@@ -131,150 +132,155 @@ class BeamExplorer:
                 self.db_manager.update_ngram_quota(self.model_db_id, ngram_size_str, ngram_text, is_refusal)
 
 
-    # core/explorer.py  –  replace the whole explore() method
+    # core/explorer.py
     def explore(self) -> None:
         """
-        Breadth-first beam expansion that matches the requested flow:
+        Breadth-first beam search with two batched RPC phases per layer:
 
-        • layer-0: prompt prefix, pick top-k next-tokens (after min_p etc.)
-        • append `pilot_beam_length` greedy tokens to each child
-        • run refusal detector on the resulting text
-        • repeat for the next position, branching every live beam
-        • keep at most `branch_cap` beams – stratified 50/50 by refusal state
+        1) /completions (logprobs=K)  – one request per live beam
+        2) /completions (greedy tail) – one request per (beam × candidate)
+        3) Refusal classification     – batched inside RefusalWorker
         """
-        cfg  = self.config
-        ex   = cfg.exploration
-        samp = self.sampler
-        pilot_len   = ex.pilot_beam_length
-        cap         = ex.branch_cap
-        balance_p   = ex.balance_ratio
+        cfg        = self.config
+        ex         = cfg.exploration
+        sampler    = self.sampler
+        pilot_len  = ex.pilot_beam_length
+        cap        = ex.branch_cap
+        balance_p  = ex.balance_ratio
+        max_depth  = ex.max_split_positions
 
-        # --- frontier initialisation ---------------------------------
         frontier: list[Beam] = [Beam(tokens_raw=[], decoded_words=[], depth=0)]
 
-        while frontier:
-            # -------- expand every live beam in parallel --------------
-            next_frontier: list[Beam] = []
+        pool = ThreadPoolExecutor(max_workers=cfg.max_workers)
+        try:
+            while frontier:
+                # ───────────────────────── phase 1 – logprobs ─────────────────────────
+                fut_lp = {
+                    pool.submit(
+                        self.api_client.get_next_token_logprobs,
+                        prompt_prefix=(
+                            self.chat_formatter.build_prompt(
+                                self.prompt_data.text,
+                                decode_token_path(b.tokens_raw)
+                            ) if self.chat_formatter else
+                            self.prompt_data.text + decode_token_path(b.tokens_raw)
+                        ),
+                        top_n_logprobs=ex.beam_starters_top_k * 2,
+                        sampling_params=asdict(cfg.sampling_beam_starters),
+                    ): b
+                    for b in frontier
+                }
 
-            # batch RPCs for speed – one /completions per beam
-            reqs = []
-            for beam in frontier:
-                prefix_text = decode_token_path(beam.tokens_raw)
-                full_prompt = (self.chat_formatter.build_prompt(self.prompt_data.text, prefix_text)
-                            if self.chat_formatter
-                            else self.prompt_data.text + prefix_text)
-                reqs.append((beam, full_prompt))
+                beam_candidates: list[tuple[Beam, str, str]] = []          # (parent, split_tok_raw, greedy_prefix)
 
-            # Send requests concurrently but keep ordering
-            with ThreadPoolExecutor(max_workers=self.config.max_workers) as pool:
-                fut2beam = {pool.submit(
-                    self.api_client.get_next_token_logprobs,
-                    prompt_prefix=prompt,
-                    top_n_logprobs = ex.beam_starters_top_k * 2,
-                    sampling_params = asdict(cfg.sampling_beam_starters)
-                ): beam for beam, prompt in reqs}
-
-                for fut in as_completed(fut2beam):
-                    beam = fut2beam[fut]
+                for fut in as_completed(fut_lp):
+                    beam = fut_lp[fut]
                     try:
                         lp_resp = fut.result()
                     except Exception as e:
                         logger.error(f"logprob RPC failed: {e}")
                         continue
 
-                    cand_tok_raw = samp.sample_candidate_tokens(
-                        lp_resp.logprobs,
-                        ex.beam_starters_top_k
+                    cand_tokens = sampler.sample_candidate_tokens(
+                        lp_resp.logprobs, ex.beam_starters_top_k
                     )
-                    if not cand_tok_raw:
-                        continue
-
-                    # each candidate becomes a child beam
-                    for tok_raw in cand_tok_raw:
-                        # greedy tail
-                        greedy_prefix = (self.chat_formatter.build_prompt(
-                            self.prompt_data.text,
-                            decode_token_path(beam.tokens_raw + [tok_raw])
-                        ) if self.chat_formatter else
-                            self.prompt_data.text + decode_token_path(beam.tokens_raw + [tok_raw]))
-
-                        try:
-                            greedy_resp = self.api_client.greedy_sample(
-                                greedy_prefix,
-                                num_tokens = pilot_len
-                            )
-                            tail_raw = greedy_resp.token_strings_raw
-                        except Exception as e:
-                            logger.error(f"greedy RPC failed: {e}")
-                            tail_raw = []
-
-                        full_raw_path = beam.tokens_raw + [tok_raw] + tail_raw
-                        full_decoded  = decode_token_path(full_raw_path)
-
-                        # refusal classification
-                        is_ref, conf, lbl = self.refusal_detector.is_refusal(
-                            self.prompt_data.text, full_decoded,
-                            threshold=cfg.refusal_classifier.threshold
+                    for tok_raw in cand_tokens:
+                        greedy_prefix = (
+                            self.chat_formatter.build_prompt(
+                                self.prompt_data.text,
+                                decode_token_path(beam.tokens_raw + [tok_raw])
+                            ) if self.chat_formatter else
+                            self.prompt_data.text + decode_token_path(beam.tokens_raw + [tok_raw])
                         )
+                        beam_candidates.append((beam, tok_raw, greedy_prefix))
 
-                        # record (exactly as old code did)
-                        self.db_manager.record_exploration_result(
-                            model_db_id = self.model_db_id,
-                            prompt_db_id = self.prompt_data.db_id,
-                            beam_path_raw = full_raw_path,
-                            split_token_raw = tok_raw,
-                            full_generation_text_decoded = full_decoded,
-                            is_refusal = is_ref,
-                            refusal_label = lbl,
-                            refusal_confidence = conf,
-                            exploration_depth = beam.depth
+                if not beam_candidates:
+                    break
+
+                # ──────────────────────── phase 2 – greedy tails ───────────────────────
+                fut_tail = {
+                    pool.submit(
+                        self.api_client.greedy_sample,
+                        prompt_prefix=gp,
+                        num_tokens=pilot_len,
+                    ): (parent, tok_raw)
+                    for parent, tok_raw, gp in beam_candidates
+                }
+
+                # collect detector futures for this search layer
+                pending: list[
+                    tuple[concurrent.futures.Future, Beam, str, list[str], str, list[str]]
+                ] = []   # (future, parent, tok_raw, tail_raw, gen_text, parent_path_raw)
+
+                next_frontier: list[Beam] = []
+
+                for fut in as_completed(fut_tail):
+                    parent, tok_raw = fut_tail[fut]
+                    try:
+                        tail_resp = fut.result()
+                        tail_raw  = tail_resp.token_strings_raw
+                    except Exception as e:
+                        logger.error(f"greedy RPC failed: {e}")
+                        tail_raw = []
+
+                    path_raw = parent.tokens_raw + [tok_raw] + tail_raw
+                    gen_text = decode_token_path(path_raw)
+
+                    future = self.refusal_worker.submit(self.prompt_data.text, gen_text)
+                    pending.append((future, parent, tok_raw, tail_raw, gen_text, path_raw))
+
+                # ──────────────── wait for all refusal results together ────────────────
+                for fut, parent, tok_raw, tail_raw, gen_text, path_raw in pending:
+                    is_ref, conf, lbl = fut.result()
+
+                    self.db_manager.record_exploration_result(
+                        self.model_db_id,
+                        self.prompt_data.db_id,
+                        path_raw,
+                        tok_raw,
+                        gen_text,
+                        is_ref,
+                        lbl,
+                        conf,
+                        parent.depth,
+                    )
+
+                    self._update_all_quotas(
+                        current_beam_path_raw            = parent.tokens_raw,
+                        split_token_raw                  = tok_raw,
+                        is_refusal                       = is_ref,
+                        previous_decoded_words_for_ngram = parent.decoded_words,
+                    )
+
+                    child_dec_words = parent.decoded_words + \
+                        self.ngram_util._tokenize_and_clean(decode_token(tok_raw))
+
+                    next_frontier.append(
+                        Beam(
+                            tokens_raw    = parent.tokens_raw + [tok_raw],
+                            decoded_words = child_dec_words,
+                            depth         = parent.depth + 1,
+                            is_refusal    = is_ref,
+                            conf          = conf,
                         )
+                    )
 
-                        # bookkeeping + quotas
-                        cleaned_words = (beam.decoded_words +
-                                        self.ngram_util._tokenize_and_clean(
-                                            decode_token(tok_raw)
-                                        ) +
-                                        self.ngram_util._tokenize_and_clean(
-                                            decode_token_path(tail_raw)
-                                        ))
-                        self._update_all_quotas(
-                            current_beam_path_raw = beam.tokens_raw,
-                            split_token_raw       = tok_raw,
-                            is_refusal            = is_ref,
-                            previous_decoded_words_for_ngram = beam.decoded_words
-                        )
+                # ──────────────── branch-capping / balancing ────────────────
+                if len(next_frontier) > cap:
+                    refusals     = [b for b in next_frontier if  b.is_refusal]
+                    non_refusals = [b for b in next_frontier if not b.is_refusal]
+                    keep_ref = int(cap * balance_p)
+                    keep_non = cap - keep_ref
+                    random.shuffle(refusals)
+                    random.shuffle(non_refusals)
+                    next_frontier = refusals[:keep_ref] + non_refusals[:keep_non]
 
-                        # child beam for next layer – it starts *after* the pilot segment
-                        next_frontier.append(
-                            Beam(
-                                tokens_raw   = full_raw_path,
-                                decoded_words = cleaned_words,
-                                depth = beam.depth + 1,
-                                is_refusal = is_ref,
-                                conf = conf
-                            )
-                        )
+                if not next_frontier or next_frontier[0].depth >= max_depth:
+                    break
 
-            # -------- branch-cap & balancing ---------------------------
-            if len(next_frontier) > cap:
-                refusals     = [b for b in next_frontier if  b.is_refusal]
-                non_refusals = [b for b in next_frontier if not b.is_refusal]
+                frontier = next_frontier
+        finally:
+            pool.shutdown(wait=True)
+            self.refusal_worker.shutdown()
 
-                keep_ref = int(cap * balance_p)
-                keep_non = cap - keep_ref
 
-                random.shuffle(refusals)
-                random.shuffle(non_refusals)
-
-                next_frontier = refusals[:keep_ref] + non_refusals[:keep_non]
-
-            # depth / length termination
-            if not next_frontier:
-                break
-            if next_frontier[0].depth >= ex.max_exploration_depth:
-                break
-            if any(len(b.tokens_raw) >= ex.max_total_generation_length for b in next_frontier):
-                break
-
-            frontier = next_frontier
